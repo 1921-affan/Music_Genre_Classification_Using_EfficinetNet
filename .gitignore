@@ -1,0 +1,14 @@
+# Large model files
+*.h5
+*.keras
+*.zip
+*.csv
+
+# Dataset Folders
+archive/
+Dataset/
+enhanced_dataset/
+
+# System files
+__pycache__/
+.ipynb_checkpoints/
