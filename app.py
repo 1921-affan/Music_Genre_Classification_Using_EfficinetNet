@@ -3,6 +3,7 @@ import tensorflow as tf
 import numpy as np
 from PIL import Image
 import tensorflow.keras.models as models
+import cv2
 
 # ==========================================
 # CONFIGURATION
@@ -19,14 +20,98 @@ CLASS_NAMES = ['cataract', 'diabetic_retinopathy', 'glaucoma', 'normal']
 MODEL_PATH = 'xception_final_boost.h5' # The 88.85% Champion Model
 
 # ==========================================
-# CORE LOGIC
+# PREPROCESSING FUNCTIONS (from training)
 # ==========================================
+
+def crop_black_margins(image, threshold=10):
+    """Remove black margins from fundus images"""
+    # Convert to grayscale
+    gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+    
+    # Find non-black pixels
+    coords = cv2.findNonZero((gray > threshold).astype(np.uint8))
+    
+    if coords is not None:
+        x, y, w, h = cv2.boundingRect(coords)
+        cropped = image[y:y+h, x:x+w]
+        return cropped
+    return image
+
+def ben_graham_preprocessing(image, target_size=512):
+    """
+    Ben Graham's preprocessing:
+    1. Crop black margins
+    2. Resize to target size
+    3. Color normalization (subtract local average)
+    4. Gaussian filtering
+    """
+    # Step 1: Crop black margins
+    image = crop_black_margins(image)
+    
+    # Step 2: Resize to consistent size
+    image = cv2.resize(image, (target_size, target_size))
+    
+    # Step 3: Color normalization - subtract local average color
+    image = image.astype(np.float32)
+    
+    # Calculate local average using Gaussian blur
+    local_avg = cv2.GaussianBlur(image, (0, 0), target_size/30)
+    
+    # Subtract local average and add 128 to center around mid-gray
+    image = image - local_avg + 128
+    
+    # Clip values to valid range
+    image = np.clip(image, 0, 255).astype(np.uint8)
+    
+    # Step 4: Apply Gaussian filter to reduce noise
+    image = cv2.GaussianBlur(image, (5, 5), 0)
+    
+    return image
+
+def apply_clahe(image):
+    """
+    Apply CLAHE (Contrast Limited Adaptive Histogram Equalization)
+    to enhance blood vessels and lesions
+    """
+    # Convert to LAB color space
+    lab = cv2.cvtColor(image, cv2.COLOR_RGB2LAB)
+    
+    # Split channels
+    l, a, b = cv2.split(lab)
+    
+    # Apply CLAHE to L channel
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    l = clahe.apply(l)
+    
+    # Merge channels
+    enhanced_lab = cv2.merge([l, a, b])
+    
+    # Convert back to RGB
+    enhanced = cv2.cvtColor(enhanced_lab, cv2.COLOR_LAB2RGB)
+    
+    return enhanced
+
+def enhance_fundus_image(pil_image, target_size=224):
+    """
+    Complete enhancement pipeline (matching training):
+    1. Apply Ben Graham's preprocessing
+    2. Apply CLAHE
+    """
+    # Convert PIL to numpy array (RGB)
+    image = np.array(pil_image)
+    
+    # Apply Ben Graham's preprocessing
+    image = ben_graham_preprocessing(image, target_size)
+    
+    # Apply CLAHE
+    image = apply_clahe(image)
+    
+    return image
 
 @st.cache_resource
 def load_model():
     """Load the Champion Xception Model."""
     try:
-        # Xception (H5 format) is robust and loads reliably
         model = models.load_model(MODEL_PATH, compile=False)
         return model, None
     except Exception as e:
@@ -36,13 +121,12 @@ def predict(model, image):
     """
     Run inference using the Xception model.
     """
-    # Preprocess for Xception
-    img_resized = image.resize((IMG_SIZE, IMG_SIZE))
-    img_array = np.array(img_resized)
+    # CRITICAL: Apply CLAHE + Ben Graham enhancement first (training data was enhanced)
+    enhanced_img = enhance_fundus_image(image, target_size=224)
     
-    # Normalize: Xception model HAS internal Rescaling layer
-    # So we pass raw [0-255] values.
-    # img_array = img_array / 127.5 - 1  <-- REMOVED (Double Normalization)
+    # Convert enhanced numpy array back to PIL for resize
+    # (enhance_fundus_image already outputs 224x224, so just convert to tensor)
+    img_array = enhanced_img.astype(np.float32)
     img_array = np.expand_dims(img_array, axis=0)
     
     # Predict
@@ -81,7 +165,7 @@ with col1:
     
     if uploaded_file is not None:
         image = Image.open(uploaded_file).convert('RGB')
-        st.image(image, caption='Patient Scan', use_column_width=True)
+        st.image(image, caption='Patient Scan', width=300)
 
 with col2:
     st.subheader("2. Analysis Results")
@@ -89,19 +173,42 @@ with col2:
     if uploaded_file is not None:
         if st.button("Run Diagnostics", type="primary"):
             with st.spinner("Analyzing retina patterns..."):
+                # 1. Standard Prediction
                 preds = predict(model, image)
-                
-                # Get Top Prediction
                 idx = np.argmax(preds)
                 diagnosis = CLASS_NAMES[idx]
                 confidence = preds[idx] * 100
                 
-                # Display
+                # 2. Grad-CAM Generation
+                try:
+                    # CRITICAL: Apply same enhancement as predict()
+                    enhanced_img = enhance_fundus_image(image, target_size=224)
+                    img_array = enhanced_img.astype(np.float32)
+                    img_array = np.expand_dims(img_array, axis=0) # (1, 224, 224, 3)
+                    
+                    # Generate Heatmap
+                    # Generate Heatmap
+                    from gradcam import make_gradcam_heatmap, overlay_heatmap
+                    # For Xception, the last conv layer is 'block14_sepconv2_act'
+                    # (Smart gradcam will find it even if nested)
+                    heatmap = make_gradcam_heatmap(img_array, model, last_conv_layer_name="block14_sepconv2_act", pred_index=idx)
+                    
+                    # Overlay
+                    # Use the enhanced image for display consistency
+                    overlay = overlay_heatmap(heatmap, enhanced_img, alpha=0.4)
+                    
+                    # Show XAI Result
+                    st.image(overlay, caption=f"Explainable AI: Evidence for {diagnosis.upper()}", width=300)
+                    
+                except Exception as e:
+                    st.warning(f"Could not generate Grad-CAM: {e}")
+                
+                # Display Diagnosis
                 color = "green" if diagnosis == 'normal' else "red"
                 st.markdown(f"### Diagnosis: :{color}[{diagnosis.upper().replace('_', ' ')}]")
                 st.metric("Confidence Score", f"{confidence:.2f}%")
                 
-                # Chart
+                # Probability Chart
                 st.write("---")
                 st.write("**Probability Distribution:**")
                 for i, cls in enumerate(CLASS_NAMES):
